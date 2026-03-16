@@ -40,8 +40,11 @@ print(f"   实时价格: WebSocket | K线数据: REST API（仅新K线时请求�
 
 
 # ================= WebSocket 实时价格 =================
-_ws_price: float = None       # WebSocket 推送的最新价格（线程间共享）
+_ws_price: float = None        # WebSocket 推送的最新价格（线程间共享）
+_ws_price_time: str = None     # WebSocket 推送的价格对应北京时间（字符串）
 _ws_connected: bool = False
+
+_CST_OFFSET = datetime.timezone(datetime.timedelta(hours=8))  # 北京时间 UTC+8
 
 
 def _on_ws_open(ws):
@@ -52,10 +55,16 @@ def _on_ws_open(ws):
 
 
 def _on_ws_message(ws, message):
-    global _ws_price
+    global _ws_price, _ws_price_time
     data = json.loads(message)
     if data.get('event') == 'price' and 'price' in data:
         _ws_price = float(data['price'])
+        ts = data.get('timestamp')
+        if ts:
+            cst_dt = datetime.datetime.fromtimestamp(int(ts), tz=_CST_OFFSET)
+            _ws_price_time = cst_dt.strftime('%H:%M:%S')
+        else:
+            _ws_price_time = datetime.datetime.now().strftime('%H:%M:%S')
 
 
 def _on_ws_error(ws, error):
@@ -91,19 +100,33 @@ def start_websocket():
 
 
 def get_realtime_price():
-    """获取实时价格：优先 WebSocket，不可用时降级到 REST"""
+    """
+    获取实时价格，返回 (price, time_str) 元组。
+    优先使用 WebSocket 推送数据；不可用时降级到 REST /quote 接口，
+    time_str 取 last_quote_at（最新报价时间）转换后的北京时间字符串。
+    """
     if _ws_price is not None:
-        return _ws_price
+        return _ws_price, _ws_price_time
+
     try:
         resp = requests.get(
-            'https://api.twelvedata.com/price',
+            'https://api.twelvedata.com/quote',
             params={'symbol': SYMBOL, 'apikey': TWELVEDATA_API_KEY},
             timeout=6
         )
-        return float(resp.json()['price'])
+        data = resp.json()
+        price = float(data['close'])
+        # last_quote_at：最新报价的 Unix 时间戳（秒）
+        ts = data.get('last_quote_at') or data.get('timestamp')
+        if ts:
+            cst_dt = datetime.datetime.fromtimestamp(int(ts), tz=_CST_OFFSET)
+            time_str = cst_dt.strftime('%H:%M:%S')
+        else:
+            time_str = None
+        return price, time_str
     except Exception as e:
         print(f"⚠️ 实时价格获取失败: {e}")
-        return None
+        return None, None
 
 
 # ================= 数据获取与指标计算 =================
@@ -168,7 +191,7 @@ def _expected_candle_ts():
     """计算当前应已完成的K线时间戳（当前5分钟窗口的上一个窗口）"""
     now = datetime.datetime.now()
     window_start = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    return (window_start - datetime.timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+    return (window_start - datetime.timedelta(minutes=4)).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def refresh_kline_if_needed():
@@ -364,7 +387,7 @@ def handle_resonance_notify(sig_type, candle_ts, message, alerted_signals):
 
 
 # ================= 主循环业务方法 =================
-def print_market_status(df, realtime_price):
+def print_market_status(df, price_info):
     """打印当前行情：实时价 + 已完成K线 OHLC + 指标概览"""
     latest = df.iloc[-2]
 
@@ -388,9 +411,11 @@ def print_market_status(df, realtime_price):
     except Exception:
         candle_range = latest['timestamp']
 
+    realtime_price, price_time = price_info
     rt_str = f"{realtime_price:.2f}" if realtime_price else "N/A"
-    ws_tag = "(WebSocket)" if _ws_connected and _ws_price else "(REST)"
-    print(f"   ┌─ 实时价: {rt_str} USD {ws_tag}")
+    source = "WebSocket" if (_ws_connected and _ws_price) else "REST"
+    time_tag = f"({source} @ {price_time} 北京时间)" if price_time else f"({source})"
+    print(f"   ┌─ 实时价: {rt_str} USD {time_tag}")
     print(f"   ├─ 已完成K线 [{candle_range}]  开:{latest['open']:.2f}  高:{latest['high']:.2f}  低:{latest['low']:.2f}  收:{latest['close']:.2f}")
     print(
         f"   ├─ MACD: {macd_val:.3f}/{sig_val:.3f} {macd_trend} | "
@@ -475,10 +500,7 @@ while True:
         if is_weekend():
             print("⏸️  周末黄金市场休市，1小时后重试...")
             time.sleep(3600)
-            continue
-
-        print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
-
+            break
         if not refresh_kline_if_needed():
             print("   K线获取失败，等待下一个 :30 重试...")
             sleep_until_next_half_minute()
