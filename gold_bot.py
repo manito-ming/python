@@ -1,8 +1,12 @@
+import base64
+import hashlib
+import hmac
 import json
 import ssl
 import threading
 import time
 import datetime
+import urllib.parse
 import requests
 import warnings
 
@@ -18,8 +22,10 @@ TIMEFRAME = '5min'
 LIMIT = 150                 # 拉取的K线数量
 TWELVEDATA_API_KEY = '448e2ece2d694647bf506939595c28e4'
 
-DINGTALK_WEBHOOK = ''
-ENABLE_NOTIFY = bool(DINGTALK_WEBHOOK)
+DINGTALK_WEBHOOK = ''   # 完整 Webhook 地址
+DINGTALK_SECRET  = ''   # 加签 Secret（群机器人 → 安全设置 → 加签）；不启用留空
+SERVERCHAN_KEY   = ''   # Server酱 Turbo SendKey（sct.ftqq.com 登录后获取，SCT 开头），免费 5条/天
+ENABLE_NOTIFY = bool(DINGTALK_WEBHOOK) or bool(SERVERCHAN_KEY)
 
 MACD_FAST   = 6
 MACD_SLOW   = 13
@@ -355,13 +361,29 @@ def check_warnings(df):
 
 
 # ================= 通知 =================
-def send_notification(message):
-    """发送钉钉通知（未配置时静默）"""
-    if not ENABLE_NOTIFY:
+def _build_webhook_url():
+    """若配置了加签 Secret，拼接 timestamp+sign 参数后返回完整 URL"""
+    if not DINGTALK_SECRET:
+        return DINGTALK_WEBHOOK
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{DINGTALK_SECRET}"
+    hmac_code = hmac.new(
+        DINGTALK_SECRET.encode('utf-8'),
+        string_to_sign.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+    return f"{DINGTALK_WEBHOOK}&timestamp={timestamp}&sign={sign}"
+
+
+def _send_dingtalk(message):
+    """发送钉钉通知（未配置时跳过）"""
+    if not DINGTALK_WEBHOOK:
         return
     try:
+        url = _build_webhook_url()
         resp = requests.post(
-            DINGTALK_WEBHOOK,
+            url,
             json={"msgtype": "text", "text": {"content": f"[黄金机器人]\n{message}"}},
             headers={'Content-Type': 'application/json'},
             timeout=5
@@ -369,6 +391,33 @@ def send_notification(message):
         print(f"✅ 钉钉通知已发送，状态码: {resp.status_code}")
     except Exception as e:
         print(f"❌ 钉钉通知失败: {e}")
+
+
+def _send_serverchan(message):
+    """通过 Server酱 Turbo 发送微信消息（未配置时跳过），免费 5条/天"""
+    if not SERVERCHAN_KEY:
+        return
+    try:
+        resp = requests.post(
+            f'https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send',
+            data={'title': '黄金信号提醒', 'desp': message},
+            timeout=5
+        )
+        data = resp.json()
+        if data.get('data', {}).get('errno') == 0 or data.get('code') == 0:
+            print(f"✅ Server酱微信推送成功")
+        else:
+            print(f"⚠️ Server酱推送返回: {data}")
+    except Exception as e:
+        print(f"❌ Server酱推送失败: {e}")
+
+
+def send_notification(message):
+    """同时发送钉钉 + Server酱微信推送（各自未配置时静默）"""
+    if not ENABLE_NOTIFY:
+        return
+    _send_dingtalk(message)
+    _send_serverchan(message)
 
 
 def handle_resonance_notify(sig_type, candle_ts, message, alerted_signals):
