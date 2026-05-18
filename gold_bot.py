@@ -1,4 +1,5 @@
 import json
+import ssl
 import threading
 import time
 import datetime
@@ -91,7 +92,7 @@ def start_websocket():
                     on_error=_on_ws_error,
                     on_close=_on_ws_close,
                 )
-                ws.run_forever()
+                ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
             except Exception as e:
                 print(f"⚠️ WebSocket 异常: {e}")
             time.sleep(5)
@@ -187,24 +188,33 @@ _cached_df: pd.DataFrame = None
 _cached_candle_ts: str = None
 
 
-def _expected_candle_ts():
-    """计算当前应已完成的K线时间戳（当前5分钟窗口的上一个窗口）"""
+def _expected_last_candle_ts():
+    """
+    计算当前时刻理论上最后一根已完成K线的起始时间戳（5分钟对齐）。
+    例：系统时间 11:32:xx → 返回 '2026-03-17 11:25:00'
+    """
     now = datetime.datetime.now()
     window_start = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    return (window_start - datetime.timedelta(minutes=4)).strftime('%Y-%m-%d %H:%M:%S')
+    return (window_start - datetime.timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def refresh_kline_if_needed():
-    """若出现新K线则重新拉取并计算指标，否则复用缓存"""
+    """
+    若API已有新K线则拉取并计算指标，否则复用缓存。
+    缓存标识使用API实际返回的最后一根K线时间戳，而非计算值，
+    确保API延迟时自动重试而不会因计算值"污染"缓存。
+    """
     global _cached_df, _cached_candle_ts
-    expected = _expected_candle_ts()
-    if _cached_df is None or expected != _cached_candle_ts:
-        print(f"🔄 新K线({expected})，拉取全量数据...")
-        df_new = fetch_data()
-        if df_new is None:
-            return False
-        _cached_df = calculate_indicators(df_new)
-        _cached_candle_ts = expected
+    expected = _expected_last_candle_ts()
+    if _cached_df is not None and _cached_candle_ts == expected:
+        return True  # 缓存已是最新，无需拉取
+    print(f"🔄 新K线({expected})，拉取全量数据...")
+    df_new = fetch_data()
+    if df_new is None:
+        return False
+    _cached_df = calculate_indicators(df_new)
+    # 用实际K线时间戳做缓存标识，API数据未更新时下次轮询继续重试
+    _cached_candle_ts = _cached_df.iloc[-2]['timestamp']
     return True
 
 
@@ -298,10 +308,12 @@ def check_signals(df):
 
     notify_signals = []
     for sig_type in common:
-        if not _has_trend_candles(df, sig_type):
-            required = '阴线' if ('金叉' in sig_type or sig_type == '底背离') else '阳线'
-            print(f"   ⚡ [{sig_type}] 前{TREND_CANDLE_COUNT}根K线不全为{required}，跳过通知")
-            continue
+        # 背离信号无需前置K线方向校验，直接发通知
+        if '背离' not in sig_type:
+            if not _has_trend_candles(df, sig_type):
+                required = '阴线' if '金叉' in sig_type else '阳线'
+                print(f"   ⚡ [{sig_type}] 前{TREND_CANDLE_COUNT}根K线不全为{required}，跳过通知")
+                continue
         emoji, title = signal_configs[sig_type]
         notify_signals.append({
             'type': sig_type,
@@ -484,10 +496,27 @@ def is_weekend():
 def sleep_until_next_half_minute():
     """阻塞到下一个 HH:MM:30"""
     now = datetime.datetime.now()
-    target = now.replace(second=30, microsecond=0)
+    target = now.replace(second=35, microsecond=0)
     if now >= target:
         target += datetime.timedelta(minutes=1)
     time.sleep(max((target - now).total_seconds(), 0))
+
+
+def sleep_until_next_check():
+    """
+    智能等待：距下一根K线收盘 <= 65秒时，精准等到收盘后2秒立即拉新数据；
+    否则等到下一个 HH:MM:30，保持实时价格的刷新频率。
+    """
+    now = datetime.datetime.now()
+    # 距下一个5分钟边界的分钟数（K线收盘时刻）
+    minutes_to_close = 5 - (now.minute % 5)
+    next_close = (now + datetime.timedelta(minutes=minutes_to_close)).replace(second=2, microsecond=0)
+    secs_to_close = (next_close - now).total_seconds()
+    if secs_to_close <= 65:
+        print(f"   ⏳ 距K线收盘 {secs_to_close:.0f}秒，精准等待中...")
+        time.sleep(max(secs_to_close, 0))
+    else:
+        sleep_until_next_half_minute()
 
 
 # ================= 主循环 =================
@@ -499,12 +528,12 @@ while True:
     try:
         if is_weekend():
             print("⏸️  周末黄金市场休市，1小时后重试...")
-            time.sleep(3600)
             break
         if not refresh_kline_if_needed():
             print("   K线获取失败，等待下一个 :30 重试...")
             sleep_until_next_half_minute()
             continue
+        print(f"当前服务器时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         df = _cached_df
         candle_ts = df.iloc[-2]['timestamp']
@@ -522,4 +551,4 @@ while True:
     except Exception as e:
         print(f"❌ 主循环异常: {e}")
 
-    sleep_until_next_half_minute()
+    sleep_until_next_check()
